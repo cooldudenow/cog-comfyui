@@ -1,8 +1,19 @@
+# Huggingface Hub compatibility check
+try:
+    import huggingface_hub
+    print("huggingface_hub path:", huggingface_hub.__file__)
+    print("Huggingface Hub version:", huggingface_hub.__version__)
+    # Check for hf_hub_download instead of deprecated cached_download
+    assert hasattr(huggingface_hub, "hf_hub_download"), "hf_hub_download missing from huggingface_hub"
+except Exception as e:
+    raise ImportError(f"Your Python environment is broken or corrupted: {e}. Reinstall the correct huggingface_hub.")
+
 import os
 import shutil
 import tarfile
 import zipfile
 import mimetypes
+import json
 from PIL import Image
 from typing import List, Optional
 from cog import BasePredictor, Input, Path
@@ -27,14 +38,22 @@ ALL_DIRECTORIES = [OUTPUT_DIR, INPUT_DIR, COMFYUI_TEMP_OUTPUT_DIR]
 IMAGE_TYPES = [".jpg", ".jpeg", ".png", ".webp"]
 VIDEO_TYPES = [".mp4", ".mov", ".avi", ".mkv", ".webm"]
 
-with open("examples/api_workflows/birefnet_api.json", "r") as file:
+with open("examples/api_workflows/wan22_t2v_a14b_api.json", "r") as file:
     EXAMPLE_WORKFLOW_JSON = file.read()
+
+# Constants for LoRA downloads
+LORA_HIGH_NOISE_PATH = "https://odb96bm9wznk9riz.public.blob.vercel-storage.com/Instagirlv2.0_hinoise.safetensors"
+LORA_LOW_NOISE_PATH = "https://odb96bm9wznk9riz.public.blob.vercel-storage.com/Instagirlv2.0_lownoise.safetensors"
+UPLOAD_URL = "https://jerrrycans-file.hf.space/upload"
 
 
 class Predictor(BasePredictor):
     def setup(self, weights: str):
         if bool(weights):
             self.handle_user_weights(weights)
+
+        # Download LoRAs
+        self.download_loras()
 
         self.comfyUI = ComfyUI("127.0.0.1:8188")
         self.comfyUI.start_server(OUTPUT_DIR, INPUT_DIR)
@@ -69,6 +88,82 @@ class Predictor(BasePredictor):
                                 print(
                                     f"Skipping {file} because it already exists in {destination}"
                                 )
+
+    def download_loras(self):
+        """Download LoRAs to the models directory"""
+        loras_dir = os.path.join(config["MODELS_PATH"], "loras")
+        os.makedirs(loras_dir, exist_ok=True)
+        
+        # Download high-noise LoRA
+        lora_high_path = os.path.join(loras_dir, "Instagirlv2.0_hinoise.safetensors")
+        if not os.path.exists(lora_high_path):
+            print("Downloading high-noise LoRA...")
+            try:
+                response = requests.get(LORA_HIGH_NOISE_PATH, stream=True)
+                response.raise_for_status()
+                with open(lora_high_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("✅ High-noise LoRA downloaded")
+            except Exception as e:
+                print(f"❌ Failed to download high-noise LoRA: {e}")
+        
+        # Download low-noise LoRA
+        lora_low_path = os.path.join(loras_dir, "Instagirlv2.0_lownoise.safetensors")
+        if not os.path.exists(lora_low_path):
+            print("Downloading low-noise LoRA...")
+            try:
+                response = requests.get(LORA_LOW_NOISE_PATH, stream=True)
+                response.raise_for_status()
+                with open(lora_low_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print("✅ Low-noise LoRA downloaded")
+            except Exception as e:
+                print(f"❌ Failed to download low-noise LoRA: {e}")
+
+    def upload_file(self, file_path: str, is_video: bool = False) -> str:
+        """Upload file to specified URL with better error handling"""
+        try:
+            content_type = "video/mp4" if is_video else "image/png"
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f, content_type)}
+                response = requests.post(UPLOAD_URL, files=files, timeout=300)
+            
+            if response.status_code == 200:
+                json_response = response.json()
+                if "url" in json_response:
+                    return "https://jerrrycans-file.hf.space" + json_response["url"]
+            
+            print(f"Upload failed: {response.status_code} - {response.text}")
+            return ""
+        except Exception as e:
+            print(f"Upload error: {e}")
+            return ""
+
+    def customize_workflow(self, workflow, prompt, negative_prompt, width, height, num_frames, steps, cfg, seed):
+        """Customize the workflow with user parameters"""
+        import json
+        
+        # Update prompts
+        for node_id, node in workflow.items():
+            if node.get("class_type") == "CLIPTextEncode":
+                if "positive" in node.get("_meta", {}).get("title", "").lower():
+                    node["inputs"]["text"] = prompt
+                elif "negative" in node.get("_meta", {}).get("title", "").lower():
+                    node["inputs"]["text"] = negative_prompt
+            
+            # Update KSampler parameters
+            elif node.get("class_type") == "KSampler":
+                node["inputs"]["seed"] = seed
+                node["inputs"]["steps"] = steps
+                node["inputs"]["cfg"] = cfg
+            
+            # Update video dimensions and length
+            elif node.get("class_type") == "EmptyHunyuanLatentVideo":
+                node["inputs"]["width"] = width
+                node["inputs"]["height"] = height
+                node["inputs"]["length"] = num_frames
 
     def handle_input_file(self, input_file: Path):
         file_extension = self.get_file_extension(input_file)
@@ -111,8 +206,26 @@ class Predictor(BasePredictor):
 
     def predict(
         self,
+        prompt: str = Input(
+            description="Prompt (use Instagirl trigger)",
+            default="Instagirl, photorealistic portrait, natural lighting, high quality, detailed"
+        ),
+        negative_prompt: str = Input(
+            description="Negative prompt",
+            default="blurry, low quality, distorted, deformed, ugly, bad anatomy, worst quality, low resolution, jpeg artifacts, oversaturated, noise, grain"
+        ),
+        generate_video: bool = Input(
+            description="Generate full video (unchecked = first frame only as image)",
+            default=False
+        ),
+        width: int = Input(description="Width", default=1280),
+        height: int = Input(description="Height", default=720),
+        num_frames: int = Input(description="Number of frames (video only)", default=81, ge=1, le=121),
+        num_inference_steps: int = Input(description="Steps", default=40, ge=20, le=100),
+        guidance_scale: float = Input(description="Guidance scale", default=2.5, ge=1.0, le=8.0),
+        seed: int = Input(description="Seed", default=None),
         workflow_json: str = Input(
-            description="Your ComfyUI workflow as JSON string or URL. You must use the API version of your workflow. Get it from ComfyUI using 'Save (API format)'. Instructions here: https://github.com/replicate/cog-comfyui",
+            description="Your ComfyUI workflow as JSON string or URL. Leave empty to use default Wan2.2 workflow.",
             default="",
         ),
         input_file: Optional[Path] = Input(
@@ -136,6 +249,10 @@ class Predictor(BasePredictor):
         """Run a single prediction on the model"""
         self.comfyUI.cleanup(ALL_DIRECTORIES)
 
+        # Set seed if not provided
+        if seed is None:
+            seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+
         if input_file:
             self.handle_input_file(input_file)
 
@@ -150,13 +267,26 @@ class Predictor(BasePredictor):
 
         wf = self.comfyUI.load_workflow(workflow_json_content or EXAMPLE_WORKFLOW_JSON)
 
+        # Customize workflow with user parameters
+        self.customize_workflow(wf, prompt, negative_prompt, width, height, 
+                               num_frames if generate_video else 1, 
+                               num_inference_steps, guidance_scale, seed)
+
         self.comfyUI.connect()
 
         if force_reset_cache or not randomise_seeds:
             self.comfyUI.reset_execution_cache()
 
-        if randomise_seeds:
+        if randomise_seeds and seed is None:
             self.comfyUI.randomise_seeds(wf)
+
+        print(f"Generating {'video' if generate_video else 'image'} with:")
+        print(f"  Prompt: {prompt[:80]}...")
+        print(f"  Resolution: {width}x{height}")
+        print(f"  Frames: {num_frames if generate_video else 1}")
+        print(f"  Steps: {num_inference_steps}")
+        print(f"  Guidance: {guidance_scale}")
+        print(f"  Seed: {seed}")
 
         self.comfyUI.run_workflow(wf)
 
@@ -164,7 +294,20 @@ class Predictor(BasePredictor):
         if return_temp_files:
             output_directories.append(COMFYUI_TEMP_OUTPUT_DIR)
 
+        files = self.comfyUI.get_files(output_directories)
+        
+        # Upload files and add URLs to output
+        for file_path in files:
+            if str(file_path).endswith(('.mp4', '.webm')):
+                file_url = self.upload_file(str(file_path), is_video=True)
+                if file_url:
+                    print(f"Video uploaded: {file_url}")
+            elif str(file_path).endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                file_url = self.upload_file(str(file_path), is_video=False)
+                if file_url:
+                    print(f"Image uploaded: {file_url}")
+
         optimised_files = optimise_images.optimise_image_files(
-            output_format, output_quality, self.comfyUI.get_files(output_directories)
+            output_format, output_quality, files
         )
         return [Path(p) for p in optimised_files]
